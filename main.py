@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from transformers import BertTokenizer, BertModel
+import timm
 
 
 def set_seed(seed):
@@ -68,6 +70,8 @@ class VQADataset(torch.utils.data.Dataset):
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+
+        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
         # question / answerの辞書を作成
         self.question2idx = {}
@@ -130,22 +134,19 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        
+        question = [self.df["question"][idx]]
+        question = self.tokenizer(question, return_tensors="pt", padding="max_length", truncation=True, max_length=32)
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, question, torch.Tensor(answers), int(mode_answer_idx)
+            # return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, question
+            # return image, torch.Tensor(question)
 
     def __len__(self):
         return len(self.df)
@@ -290,20 +291,38 @@ def ResNet50():
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+
+        self.efficentnet = timm.create_model("efficientnet_b0", pretrained=True)
+        self.efficentnet.classifier = nn.Identity()
+        self.text_encoder = BertModel.from_pretrained("bert-base-uncased")
+        
+        self.image_fc = nn.Linear(1280, 512)
+        self.text_fc = nn.Linear(self.text_encoder.config.hidden_size, 512)
+
+        self.attention_image_to_text = nn.MultiheadAttention(embed_dim=512, num_heads=8)
+        self.attention_text_to_image = nn.MultiheadAttention(embed_dim=512, num_heads=8)
 
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(512*2, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature = self.efficentnet(image)
+        image_feature = self.image_fc(image_feature)
 
-        x = torch.cat([image_feature, question_feature], dim=1)
+        question_feature = self.text_encoder(input_ids=torch.transpose(question["input_ids"],0,1).squeeze(0), attention_mask=torch.transpose(question["attention_mask"],0,1).squeeze(0)).last_hidden_state[:, 0, :]
+        question_feature = self.text_fc(question_feature)
+
+        image_feature = image_feature.unsqueeze(0)
+        question_feature = question_feature.unsqueeze(0)
+
+
+        attn_output_image_to_text, _ = self.attention_image_to_text(image_feature, question_feature, question_feature)
+        attn_output_text_to_image, _ = self.attention_text_to_image(question_feature, image_feature, image_feature)
+
+        x = torch.cat([attn_output_image_to_text.squeeze(0), attn_output_text_to_image.squeeze(0)], dim=1)
         x = self.fc(x)
 
         return x
@@ -318,6 +337,8 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
+    print("start training...")
+
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
@@ -332,7 +353,7 @@ def train(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
         simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-
+    print("end training...")
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
@@ -372,16 +393,17 @@ def main():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 10
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
+    print("start training...")
     # train model
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
@@ -393,6 +415,7 @@ def main():
 
     # 提出用ファイルの作成
     model.eval()
+    torch.save(model.state_dict(), "model.pth")
     submission = []
     for image, question in test_loader:
         image, question = image.to(device), question.to(device)
