@@ -344,7 +344,7 @@ def train(model, dataloader, optimizer, criterion, device):
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        loss = criterion(pred.squeeze(0), mode_answer.squeeze())
 
         optimizer.zero_grad()
         loss.backward()
